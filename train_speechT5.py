@@ -7,9 +7,9 @@ from datasets import Dataset
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, Trainer, TrainingArguments
 
 class CustomDataCollator:
-    def __init__(self, processor, target_audio_length=80000):  # Set target audio length
+    def __init__(self, processor, target_length=512):  # Set a fixed target length
         self.processor = processor
-        self.target_audio_length = target_audio_length
+        self.target_length = target_length
 
     def __call__(self, features):
         # Process text inputs
@@ -27,26 +27,50 @@ class CustomDataCollator:
             padded_attention_mask.append(mask + [0] * padding_length)
 
         # Convert to tensors
-        input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long)  # Keep input IDs as Long
-        attention_mask_tensor = torch.tensor(padded_attention_mask, dtype=torch.long)  # Keep attention mask as Long
+        input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long)
+        attention_mask_tensor = torch.tensor(padded_attention_mask, dtype=torch.long)
 
         # Process audio features
         speech_arrays = [np.array(f["labels"]) for f in features]
-
-        # Pad audio features to the specified target length
-        padded_speech = []
+        
+        # Convert raw audio to mel spectrograms with fixed length
+        mel_specs = []
         for audio in speech_arrays:
-            if len(audio) > self.target_audio_length:
-                audio = audio[:self.target_audio_length]  # Truncate if too long
+            # Ensure audio length is consistent
+            target_audio_length = int(self.target_length * 512)  # hop_length=512
+            if len(audio) > target_audio_length:
+                audio = audio[:target_audio_length]
             else:
-                audio = np.pad(audio, (0, self.target_audio_length - len(audio)), mode='constant')
-            padded_speech.append(audio)
+                audio = np.pad(audio, (0, target_audio_length - len(audio)), mode='constant')
 
-        # Convert to tensor and ensure the dtype is Float
-        speech_tensor = torch.tensor(padded_speech, dtype=torch.float32)  # Ensure it's float32
+            # Convert to mel spectrogram
+            mel_spec = librosa.feature.melspectrogram(
+                y=audio,
+                sr=16000,
+                n_mels=80,
+                n_fft=2048,
+                hop_length=512,
+                win_length=2048,
+                center=True,
+                pad_mode='reflect'
+            )
+            
+            # Convert to log mel spectrogram
+            mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+            # Transpose to get time dimension first (T x 80)
+            mel_spec = mel_spec.T
+            
+            # Ensure exact length
+            if mel_spec.shape[0] > self.target_length:
+                mel_spec = mel_spec[:self.target_length, :]
+            elif mel_spec.shape[0] < self.target_length:
+                padding = np.zeros((self.target_length - mel_spec.shape[0], 80))
+                mel_spec = np.concatenate([mel_spec, padding], axis=0)
+                
+            mel_specs.append(mel_spec)
 
-        # Ensure the shape of audio matches what the model expects
-        speech_tensor = speech_tensor.unsqueeze(1)  # Adding an additional dimension
+        # Convert to tensor (B x T x 80)
+        speech_tensor = torch.tensor(np.stack(mel_specs), dtype=torch.float32)
 
         return {
             "input_ids": input_ids_tensor,
@@ -65,14 +89,8 @@ def load_audio(file_path, dataset_dir, max_duration=10.0):
         # Load audio with specified duration limit
         speech_array, sampling_rate = librosa.load(full_path, sr=16000, duration=max_duration)
         if speech_array is not None and len(speech_array) > 0:
-            speech_array = librosa.util.normalize(speech_array).astype(np.float32)  # Ensure float32
-            # Ensure consistent length (10 seconds = 160000 samples at 16kHz)
-            target_length = int(max_duration * 16000)
-            if len(speech_array) > target_length:
-                speech_array = speech_array[:target_length]
-            elif len(speech_array) < target_length:
-                speech_array = np.pad(speech_array, (0, target_length - len(speech_array)), mode='constant')
-            return speech_array.tolist()
+            speech_array = librosa.util.normalize(speech_array)
+            return speech_array
         else:
             print(f"Loaded audio is empty: {full_path}")
             return None
@@ -100,7 +118,7 @@ def prepare_dataset(df, dataset_dir, processor):
             processed_item = {
                 'input_ids': text_inputs['input_ids'][0].tolist(),
                 'attention_mask': text_inputs['attention_mask'][0].tolist(),
-                'labels': audio,
+                'labels': audio.tolist(),
                 'text': row['Text']
             }
             
@@ -113,8 +131,7 @@ def prepare_dataset(df, dataset_dir, processor):
         raise ValueError("No data was successfully processed")
     
     print(f"Successfully processed {len(processed_data)} files")
-    dataset = Dataset.from_list(processed_data)
-    return dataset
+    return Dataset.from_list(processed_data)
 
 def main():
     # Set device
@@ -125,6 +142,7 @@ def main():
     print("Loading model components...")
     processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
     model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts")
+    model.config.use_cache = False
     model.to(device)
 
     # Load metadata
