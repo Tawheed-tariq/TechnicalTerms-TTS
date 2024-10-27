@@ -8,7 +8,7 @@ model = SpeechT5ForTextToSpeech.from_pretrained("tawheed-tariq/speecht5_tts", re
 processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
 vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
 
-text = "Text-to-speech, or TTS, transforms text input into spoken voice output using advanced neural networks."
+text = "Hello, my name is Tawheed. I am a research engineer at Microsoft."
 inputs = processor(text=text, return_tensors="pt")
 
 embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation", trust_remote_code=True)
